@@ -10,13 +10,10 @@ from telethon.errors import UserAlreadyParticipantError, SessionPasswordNeededEr
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 
-
-# ============ تنظیمات از محیط ============
-
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_ID: int = 6474515118   # مالک اصلی ربات
+OWNER_ID: int = 6474515118
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -27,82 +24,58 @@ if not DATABASE_URL:
     print("WARNING: DATABASE_URL not set. DB-related features are disabled for now.")
 
 
-# ============ مدل‌ها ============
-
 @dataclass
 class AccountConfig:
     api_id: int
     api_hash: str
     phone: str
-    password: Optional[str] = None  # برای 2FA (اگه نباشه None)
+    password: Optional[str] = None
 
 
 @dataclass
 class ProfileData:
-    """
-    پروفایل هر کاربر پنل (مالک یا کاربر ویژه):
-    همه چیز جدا نگه داشته می‌شود.
-    """
     accounts: List[AccountConfig] = field(default_factory=list)
-    user_clients: Dict[str, TelegramClient] = field(default_factory=dict)            # phone -> client
-    client_to_phone: Dict[TelegramClient, str] = field(default_factory=dict)         # client -> phone
-    source_channels: List[str] = field(default_factory=list)                         # کانال‌های منبع (string)
-    source_channel_ids: Set[int] = field(default_factory=set)                        # chat_id کانال‌های منبع
-    target_chats: Dict[str, Set[int]] = field(default_factory=dict)                  # phone -> set(chat_id)
-    messages: List[str] = field(default_factory=list)                                # لیست پیام‌های رندوم
-    timer_type: str = "fixed"                                                       # "fixed" یا "random"
-    timer_value: int = 5                                                            # دقیقه
+    user_clients: Dict[str, TelegramClient] = field(default_factory=dict)
+    client_to_phone: Dict[TelegramClient, str] = field(default_factory=dict)
+    source_channels: List[str] = field(default_factory=list)
+    source_channel_ids: Set[int] = field(default_factory=set)
+    target_chats: Dict[str, Set[int]] = field(default_factory=dict)
+    messages: List[str] = field(default_factory=list)
+    timer_type: str = "fixed"
+    timer_value: int = 5
     sending_active: bool = False
     send_tasks: List[asyncio.Task] = field(default_factory=list)
 
 
-# ============ حافظه‌ی سراسری ============
-
-# پروفایل هر کاربر پنل؛ کلید = user_id
 profiles: Dict[int, ProfileData] = {}
-
-# کاربران ویژه: user_id → پنل جدا
 SPECIAL_USERS: Set[int] = set()
-
-# نگاشت global برای اینکه از روی client بفهمیم مال کدام مالک/کاربر ویژه است
 client_owner: Dict[TelegramClient, int] = {}
-
-# state ماشین برای هر user_id (مالک یا ویژه)
 user_states: Dict[int, str] = {}
 pending_account: Dict[int, Dict] = {}
 
-# stateها
 STATE_NONE = ""
 STATE_ACC_API_ID = "ACC_API_ID"
 STATE_ACC_API_HASH = "ACC_API_HASH"
 STATE_ACC_PHONE = "ACC_PHONE"
 STATE_ACC_CODE = "ACC_CODE"
 STATE_ACC_2FA = "ACC_2FA"
-
 STATE_WAIT_ACCOUNT_REMOVE = "WAIT_ACCOUNT_REMOVE"
 STATE_WAIT_CHANNEL_ADD = "WAIT_CHANNEL_ADD"
 STATE_WAIT_CHANNEL_REMOVE = "WAIT_CHANNEL_REMOVE"
-
 STATE_WAIT_MESSAGE_ADD = "WAIT_MESSAGE_ADD"
 STATE_WAIT_MESSAGE_REMOVE = "WAIT_MESSAGE_REMOVE"
 STATE_WAIT_TIMER_VALUE = "WAIT_TIMER_VALUE"
-
 STATE_WAIT_SPECIAL_ADD = "WAIT_SPECIAL_ADD"
 STATE_WAIT_SPECIAL_REMOVE = "WAIT_SPECIAL_REMOVE"
 
 TELEGRAM_LINK_REGEX = re.compile(r"(https?://t\.me/[^\s]+)")
 
 
-# ============ کمک‌تابع‌ها ============
-
 def log(prefix: str, msg: str):
     print(f"[{prefix}] {msg}")
 
 
 def get_profile(owner_id: int) -> ProfileData:
-    """
-    پروفایل مربوط به owner_id (چه OWNER اصلی، چه کاربر ویژه) را می‌دهد.
-    """
     if owner_id not in profiles:
         profiles[owner_id] = ProfileData()
     return profiles[owner_id]
@@ -124,9 +97,6 @@ def is_owner(user_id: int) -> bool:
 
 
 def is_allowed_user(user_id: int) -> bool:
-    """
-    کسی که به پنل دسترسی دارد: مالک یا کاربران ویژه.
-    """
     return user_id == OWNER_ID or user_id in SPECIAL_USERS
 
 
@@ -135,49 +105,34 @@ def check_admin(event) -> bool:
 
 
 def register_target_chat(client: TelegramClient, chat_id: int):
-    """
-    چت هدف برای ارسال پیام را با توجه به مالک این client ثبت می‌کند.
-    """
     owner_id = client_owner.get(client)
     if owner_id is None:
         return
-
     profile = get_profile(owner_id)
     phone = profile.client_to_phone.get(client)
     if not phone:
         return
-
     if phone not in profile.target_chats:
         profile.target_chats[phone] = set()
     profile.target_chats[phone].add(chat_id)
     log(f"{owner_id}/{phone}", f"Registered target chat: {chat_id}")
 
 
-# ============ join با لینک برای چت‌های هدف (t.me/...) ============
-
 async def join_by_link(client: TelegramClient, link: str):
-    """
-    لینک t.me را می‌گیرد و تلاش می‌کند join شود.
-    چت‌هایی که از این راه رفتیم، چت‌های target برای ارسال پیام می‌شوند.
-    """
     owner_id = client_owner.get(client)
     if owner_id is None:
         return
-
     me = await client.get_me()
     tag = f"{owner_id}/{me.username or me.id}"
-
     link = link.strip()
     log(tag, f"Trying to join by link: {link}")
 
-    # private: t.me/joinchat/... یا t.me/+...
     if "joinchat/" in link or "t.me/+" in link:
         if "joinchat/" in link:
             code = link.split("joinchat/")[1]
         else:
             code = link.split("t.me/+")[1]
         code = code.split("?")[0]
-
         try:
             res = await client(ImportChatInviteRequest(code))
             chat_id = None
@@ -192,7 +147,6 @@ async def join_by_link(client: TelegramClient, link: str):
             log(tag, f"Failed to join by private invite: {e}")
         return
 
-    # public: t.me/username
     try:
         entity = await client.get_entity(link)
         await client(JoinChannelRequest(entity))
@@ -209,15 +163,8 @@ async def join_by_link(client: TelegramClient, link: str):
         log(tag, f"Failed to join public link: {e}")
 
 
-# ============ join کانال‌های منبع ============
-
 async def join_source_channel(client: TelegramClient, chan_str: str, owner_id: int):
-    """
-    کانال منبع: از این کانال پیام‌ها را برای لینک t.me چک می‌کنیم.
-    فقط برای owner_id مربوط.
-    """
     profile = get_profile(owner_id)
-
     me = await client.get_me()
     tag = f"{owner_id}/{me.username or me.id}"
     chan_str = chan_str.strip()
@@ -270,8 +217,6 @@ async def join_source_channel(client: TelegramClient, chan_str: str, owner_id: i
         return None
 
 
-# ============ چک آخرین پیام کانال‌های منبع ============
-
 async def check_last_messages_for_all_channels(client: TelegramClient, owner_id: int):
     profile = get_profile(owner_id)
     me = await client.get_me()
@@ -293,45 +238,29 @@ async def check_last_messages_for_all_channels(client: TelegramClient, owner_id:
             log(tag, f"Error reading last message of {cid}: {e}")
 
 
-# ============ هندلر پیام جدید در کانال‌های منبع ============
-
 def setup_user_handlers(client: TelegramClient, owner_id: int):
-    """
-    به هر client یوزر، یک هندلر دیتا می‌بندیم که فقط روی source_channel های owner_id فعال است.
-    """
     profile = get_profile(owner_id)
 
     @client.on(events.NewMessage)
     async def handler(event: events.NewMessage.Event):
-        # فقط روی کانال‌های منبع همین owner کار کن
         if event.chat_id not in profile.source_channel_ids:
             return
-
         me = await client.get_me()
         tag = f"{owner_id}/{me.username or me.id}"
-
         text = event.message.message or ""
         links = TELEGRAM_LINK_REGEX.findall(text)
         if not links:
             return
-
         log(tag, f"New message in source {event.chat_id} has links: {links}")
         for link in links:
             await join_by_link(client, link)
 
 
-# ============ لاگین اکانت‌ها (step-by-step) ============
-
 async def finish_login_for_account(uid: int, password_used: Optional[str]):
-    """
-    وقتی sign_in کامل شد (با یا بدون 2FA)، این تابع یک اکانت جدید به پروفایل uid اضافه می‌کند.
-    """
     data = pending_account.get(uid)
     if not data:
         return
-
     profile = get_profile(uid)
-
     api_id = data["api_id"]
     api_hash = data["api_hash"]
     phone = data["phone"]
@@ -345,18 +274,14 @@ async def finish_login_for_account(uid: int, password_used: Optional[str]):
 
     setup_user_handlers(client, uid)
 
-    # join همه کانال‌های منبع همین پروفایل
     for chan_str in profile.source_channels:
         await join_source_channel(client, chan_str, uid)
 
-    # چک آخرین پیام
     await check_last_messages_for_all_channels(client, uid)
 
     pending_account.pop(uid, None)
     set_state(uid, STATE_NONE)
 
-
-# ============ مدیریت کانال‌های منبع ============
 
 async def add_source_channel_from_text(owner_id: int, text: str):
     profile = get_profile(owner_id)
@@ -384,8 +309,6 @@ async def remove_source_channel_by_index(owner_id: int, idx: int):
             await join_source_channel(client, chan_str, owner_id)
 
 
-# ============ مدیریت اکانت‌ها ============
-
 async def remove_account_by_index(owner_id: int, idx: int):
     profile = get_profile(owner_id)
     if idx < 1 or idx > len(profile.accounts):
@@ -400,14 +323,8 @@ async def remove_account_by_index(owner_id: int, idx: int):
         log(f"SYSTEM/{owner_id}", f"Account {cfg.phone} disconnected & removed.")
 
 
-# ============ سیستم ارسال پیام‌ها ============
-
 async def send_loop_for_client(client: TelegramClient, phone: str, owner_id: int):
-    """
-    حلقه‌ی ارسال پیام برای یک یوزر در یک پروفایل خاص (owner_id).
-    """
     profile = get_profile(owner_id)
-
     me = await client.get_me()
     tag = f"{owner_id}/{me.username or me.id}"
 
@@ -416,7 +333,6 @@ async def send_loop_for_client(client: TelegramClient, phone: str, owner_id: int
         log(tag, "No messages or target chats for this client.")
         return
 
-    # پیام فوری اول
     for chat_id in chats:
         try:
             text = random.choice(profile.messages)
@@ -425,7 +341,6 @@ async def send_loop_for_client(client: TelegramClient, phone: str, owner_id: int
         except Exception as e:
             log(tag, f"Failed to send initial message to {chat_id}: {e}")
 
-    # حلقه‌ی تایمردار
     while profile.sending_active:
         if profile.timer_type == "fixed":
             delay_min = profile.timer_value
@@ -515,8 +430,6 @@ async def stop_sending_process(event):
                      buttons=sending_menu_buttons(is_owner(owner_id)))
 
 
-# ============ بات مدیریتی (Telethon bot) ============
-
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
 
@@ -587,17 +500,12 @@ def special_menu_buttons():
     ]
 
 
-# ============ /start ============
-
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def bot_start(event: events.NewMessage.Event):
     uid = event.sender_id
     if not check_admin(event):
         return
-
-    # مطمئن شو پروفایل این کاربر پنل ساخته شده
     get_profile(uid)
-
     set_state(uid, STATE_NONE)
     text = (
         "سلام 👋\n"
@@ -606,8 +514,6 @@ async def bot_start(event: events.NewMessage.Event):
     )
     await event.respond(text, buttons=main_menu_buttons(is_owner(uid)))
 
-
-# ============ CallbackQuery (دکمه‌ها) ============
 
 @bot_client.on(events.CallbackQuery)
 async def bot_callback(event: events.CallbackQuery.Event):
@@ -620,16 +526,12 @@ async def bot_callback(event: events.CallbackQuery.Event):
     profile = get_profile(uid)
 
     data = event.data.decode("utf-8")
-
-    # در شروع هر callback، state را خالی کن (مگر موقع نیاز که در text handler ست می‌کنیم)
     set_state(uid, STATE_NONE)
 
-    # برگشت
     if data == "back_main":
         await event.edit("منوی اصلی 👇", buttons=main_menu_buttons(owner_flag))
         return
 
-    # ---- مدیریت اکانت‌ها ----
     if data == "menu_accounts":
         await event.edit("👤 مدیریت اکانت‌ها:", buttons=accounts_menu_buttons())
         return
@@ -666,7 +568,6 @@ async def bot_callback(event: events.CallbackQuery.Event):
         await event.edit("\n".join(lines), buttons=accounts_menu_buttons())
         return
 
-    # ---- مدیریت کانال‌ها ----
     if data == "menu_channels":
         await event.edit("📡 مدیریت کانال‌های منبع:", buttons=channels_menu_buttons())
         return
@@ -705,7 +606,6 @@ async def bot_callback(event: events.CallbackQuery.Event):
         await event.edit("\n".join(lines), buttons=channels_menu_buttons())
         return
 
-    # ---- مدیریت پیام‌ها ----
     if data == "menu_messages":
         await event.edit("💬 مدیریت پیام‌ها:", buttons=messages_menu_buttons())
         return
@@ -737,7 +637,6 @@ async def bot_callback(event: events.CallbackQuery.Event):
         await event.edit("\n".join(lines), buttons=messages_menu_buttons())
         return
 
-    # ---- تنظیم تایمر ----
     if data == "menu_timer":
         txt = (
             f"⏱ تنظیم تایمر:\n"
@@ -774,7 +673,6 @@ async def bot_callback(event: events.CallbackQuery.Event):
         )
         return
 
-    # ---- کنترل ارسال ----
     if data == "menu_sending":
         await event.edit("🚀 کنترل ارسال پیام‌ها:", buttons=sending_menu_buttons(owner_flag))
         return
@@ -787,7 +685,6 @@ async def bot_callback(event: events.CallbackQuery.Event):
         await stop_sending_process(event)
         return
 
-    # ---- مدیریت کاربران ویژه (فقط مالک) ----
     if data == "menu_special":
         if not owner_flag:
             await event.answer("فقط مالک ربات می‌تواند کاربران ویژه را مدیریت کند.", alert=True)
@@ -832,8 +729,6 @@ async def bot_callback(event: events.CallbackQuery.Event):
         return
 
 
-# ============ پیام‌های متنی (stateها) ============
-
 @bot_client.on(events.NewMessage)
 async def bot_text_handler(event: events.NewMessage.Event):
     if not event.is_private:
@@ -850,7 +745,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
 
     profile = get_profile(uid)
 
-    # ---- لاگین مرحله‌ای: api_id ----
     if state == STATE_ACC_API_ID:
         try:
             api_id = int(text)
@@ -861,14 +755,12 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond("api_id باید عددی باشه. دوباره بفرست.")
         return
 
-    # api_hash
     if state == STATE_ACC_API_HASH:
         pending_account.setdefault(uid, {})["api_hash"] = text
         set_state(uid, STATE_ACC_PHONE)
         await event.respond("شماره تلفن اکانت (مثلاً +98912...) رو بفرست.")
         return
 
-    # phone
     if state == STATE_ACC_PHONE:
         data = pending_account.setdefault(uid, {})
         data["phone"] = text
@@ -893,7 +785,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
             set_state(uid, STATE_NONE)
         return
 
-    # code
     if state == STATE_ACC_CODE:
         data = pending_account.get(uid)
         if not data:
@@ -917,7 +808,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond(f"کد اشتباه یا خطا:\n{e}\nدوباره کد را بفرست.")
         return
 
-    # 2FA
     if state == STATE_ACC_2FA:
         data = pending_account.get(uid)
         if not data:
@@ -937,7 +827,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond(f"رمز 2FA اشتباه یا خطا:\n{e}\nدوباره بفرست.")
         return
 
-    # حذف اکانت
     if state == STATE_WAIT_ACCOUNT_REMOVE:
         try:
             idx = int(text)
@@ -949,7 +838,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond(f"❌ خطا در حذف اکانت:\n{e}")
         return
 
-    # افزودن کانال منبع
     if state == STATE_WAIT_CHANNEL_ADD:
         try:
             await add_source_channel_from_text(uid, text)
@@ -960,7 +848,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond(f"❌ خطا در افزودن کانال:\n{e}")
         return
 
-    # حذف کانال منبع
     if state == STATE_WAIT_CHANNEL_REMOVE:
         try:
             idx = int(text)
@@ -972,7 +859,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond(f"❌ خطا در حذف کانال:\n{e}")
         return
 
-    # افزودن پیام
     if state == STATE_WAIT_MESSAGE_ADD:
         profile.messages.append(text)
         set_state(uid, STATE_NONE)
@@ -980,7 +866,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
         await event.respond("💬 برگردیم به منوی پیام‌ها:", buttons=messages_menu_buttons())
         return
 
-    # حذف پیام
     if state == STATE_WAIT_MESSAGE_REMOVE:
         try:
             idx = int(text)
@@ -994,7 +879,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond(f"❌ خطا در حذف پیام:\n{e}")
         return
 
-    # تنظیم مقدار تایمر
     if state == STATE_WAIT_TIMER_VALUE:
         try:
             val = int(text)
@@ -1008,12 +892,10 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond("عدد معتبر (دقیقه مثبت) وارد کن.")
         return
 
-    # افزودن کاربر ویژه (فقط مالک)
     if state == STATE_WAIT_SPECIAL_ADD and is_owner(uid):
         try:
             special_id = int(text)
             SPECIAL_USERS.add(special_id)
-            # پروفایل خالی برای این کاربر ویژه بساز
             get_profile(special_id)
             set_state(uid, STATE_NONE)
             await event.respond(
@@ -1025,7 +907,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond(f"❌ خطا در افزودن کاربر ویژه:\n{e}")
         return
 
-    # حذف کاربر ویژه (فقط مالک)
     if state == STATE_WAIT_SPECIAL_REMOVE and is_owner(uid):
         try:
             special_id = int(text)
@@ -1033,7 +914,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
                 SPECIAL_USERS.remove(special_id)
                 prof = profiles.pop(special_id, None)
                 if prof:
-                    # تمام clientهای این پروفایل را disconnect کن
                     for c in prof.user_clients.values():
                         try:
                             await c.disconnect()
@@ -1050,8 +930,6 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond(f"❌ خطا در حذف کاربر ویژه:\n{e}")
         return
 
-
-# ============ تابعی که از web.py صدا زده می‌شود ============
 
 async def run_bot():
     await bot_client.start(bot_token=BOT_TOKEN)
